@@ -23,34 +23,81 @@ PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
-# 先模擬，確認都對再改 False
-DRY_RUN = False
+# 安全開關：先測試用 True，確認沒問題再改 False
+DRY_RUN = True
 
-# 開倉數量：你現在先用小單測試
+# 總開倉數量
+# 0.1 ETH 才比較能拆 6 個 TP
 TOTAL_SIZE = Decimal("0.1")
 
-# 價格與數量精度，ETHUSDT 一般可用這樣；若 Bitget 回報精度錯，再調整
-PRICE_DECIMALS = Decimal("0.01")
-SIZE_DECIMALS = Decimal("0.0001")
+# ETHUSDT 數量步進，先用 0.01
+SIZE_STEP = Decimal("0.01")
+
+# ETHUSDT 價格精度
+PRICE_STEP = Decimal("0.01")
 
 TP_LEVELS = [
-    (Decimal("0.005"), Decimal("0.165")),  # TP1 +0.5%
-    (Decimal("0.010"), Decimal("0.165")),  # TP2 +1%
-    (Decimal("0.020"), Decimal("0.165")),  # TP3 +2%
-    (Decimal("0.030"), Decimal("0.165")),  # TP4 +3%
-    (Decimal("0.040"), Decimal("0.165")),  # TP5 +4%
-    (Decimal("0.050"), Decimal("0.175")),  # TP6 +5%
+    (Decimal("0.005"), Decimal("0.165")),  # TP1 0.5%
+    (Decimal("0.010"), Decimal("0.165")),  # TP2 1%
+    (Decimal("0.020"), Decimal("0.165")),  # TP3 2%
+    (Decimal("0.030"), Decimal("0.165")),  # TP4 3%
+    (Decimal("0.040"), Decimal("0.165")),  # TP5 4%
+    (Decimal("0.050"), Decimal("0.175")),  # TP6 5%
 ]
 
 SL_PCT = Decimal("0.10")  # 10%
 
 
 def q_price(x: Decimal) -> str:
-    return str(x.quantize(PRICE_DECIMALS, rounding=ROUND_HALF_UP))
+    return str(x.quantize(PRICE_STEP, rounding=ROUND_HALF_UP))
 
 
-def q_size(x: Decimal) -> str:
-    return str(x.quantize(SIZE_DECIMALS, rounding=ROUND_DOWN))
+def normalize_size(size: Decimal) -> Decimal:
+    return (size // SIZE_STEP) * SIZE_STEP
+
+
+def q_size(size: Decimal) -> str:
+    return str(normalize_size(size).quantize(SIZE_STEP, rounding=ROUND_DOWN))
+
+
+def calc_tp_sizes():
+    """
+    前5個TP向下取到0.01，最後一個吃剩餘數量。
+    避免所有TP加總小於總倉位。
+    """
+    sizes = []
+    used = Decimal("0")
+
+    for i, (_, ratio) in enumerate(TP_LEVELS, start=1):
+        if i < len(TP_LEVELS):
+            s = normalize_size(TOTAL_SIZE * ratio)
+            sizes.append(s)
+            used += s
+        else:
+            last = normalize_size(TOTAL_SIZE - used)
+            sizes.append(last)
+
+    return sizes
+
+
+def precheck_sizes():
+    tp_sizes = calc_tp_sizes()
+
+    if TOTAL_SIZE < SIZE_STEP:
+        return False, f"TOTAL_SIZE 太小，至少要 {SIZE_STEP}"
+
+    for i, s in enumerate(tp_sizes, start=1):
+        if s < SIZE_STEP:
+            return False, f"TP{i} 數量太小：{s}，至少要 {SIZE_STEP}"
+
+    if sum(tp_sizes) > TOTAL_SIZE:
+        return False, "TP 加總大於總倉位"
+
+    return True, {
+        "total_size": str(TOTAL_SIZE),
+        "tp_sizes": [str(x) for x in tp_sizes],
+        "tp_sum": str(sum(tp_sizes)),
+    }
 
 
 def sign(timestamp, method, path, body=""):
@@ -84,32 +131,8 @@ def bitget_post(path, payload):
         data=body,
         timeout=10,
     )
-    print("Bitget回應:", res.text)
 
-    try:
-        return res.json()
-    except Exception:
-        return {"raw": res.text}
-
-
-def bitget_get(path, params=None):
-    params = params or {}
-    query = ""
-    if params:
-        query = "?" + "&".join([f"{k}={v}" for k, v in params.items()])
-
-    full_path = path + query
-
-    if DRY_RUN:
-        print("DRY_RUN GET", full_path)
-        return {"dry_run": True, "data": []}
-
-    res = requests.get(
-        BASE_URL + full_path,
-        headers=headers("GET", full_path, ""),
-        timeout=10,
-    )
-    print("Bitget GET回應:", res.text)
+    print("Bitget 回應:", res.text)
 
     try:
         return res.json()
@@ -125,7 +148,6 @@ def get_last_price() -> Decimal:
     }
 
     if DRY_RUN:
-        # 模擬價格，正式下單時會抓交易所價格
         return Decimal("2400")
 
     query = "?" + "&".join([f"{k}={v}" for k, v in params.items()])
@@ -136,20 +158,17 @@ def get_last_price() -> Decimal:
         headers=headers("GET", full_path, ""),
         timeout=10,
     )
+
     data = res.json()
     print("行情回應:", data)
 
     ticker = data.get("data", [{}])[0]
     price = ticker.get("lastPr") or ticker.get("last") or ticker.get("markPrice")
+
     return Decimal(str(price))
 
 
 def cancel_all_orders():
-    """
-    取消一般委託。
-    注意：TP/SL 計畫單有時要另外取消 pending trigger order。
-    這版先放一般取消；如果你之後發現舊 TP/SL 還在，我再幫你補全取消計畫單。
-    """
     path = "/api/v2/mix/order/cancel-all-orders"
     payload = {
         "symbol": SYMBOL,
@@ -160,10 +179,6 @@ def cancel_all_orders():
 
 
 def close_position(hold_side):
-    """
-    反手前先市價平倉。
-    hold_side: long 或 short
-    """
     path = "/api/v2/mix/order/close-positions"
     payload = {
         "symbol": SYMBOL,
@@ -174,9 +189,6 @@ def close_position(hold_side):
 
 
 def open_market(direction):
-    """
-    direction: long 或 short
-    """
     path = "/api/v2/mix/order/place-order"
 
     side = "buy" if direction == "long" else "sell"
@@ -195,12 +207,7 @@ def open_market(direction):
     return bitget_post(path, payload)
 
 
-def place_tp(direction, entry_price: Decimal, index: int, pct: Decimal, ratio: Decimal):
-    """
-    用 Bitget TP/SL plan order 掛分批 TP。
-    Bitget v2 endpoint: /api/v2/mix/order/place-tpsl-order
-    planType profit_plan = 止盈，loss_plan = 止損。
-    """
+def place_tp(direction, entry_price: Decimal, index: int, pct: Decimal, size: Decimal):
     path = "/api/v2/mix/order/place-tpsl-order"
 
     hold_side = "long" if direction == "long" else "short"
@@ -209,8 +216,6 @@ def place_tp(direction, entry_price: Decimal, index: int, pct: Decimal, ratio: D
         trigger_price = entry_price * (Decimal("1") + pct)
     else:
         trigger_price = entry_price * (Decimal("1") - pct)
-
-    size = TOTAL_SIZE * ratio
 
     payload = {
         "symbol": SYMBOL,
@@ -255,39 +260,51 @@ def place_sl(direction, entry_price: Decimal):
 
 
 def run_strategy(direction):
-    """
-    direction = long 或 short
-    """
-    results = []
+    ok, check = precheck_sizes()
 
-    # 1. 取消舊單
+    if not ok:
+        return {
+            "ok": False,
+            "error": "precheck_failed",
+            "detail": check,
+        }
+
+    results = []
+    tp_sizes = calc_tp_sizes()
+
+    results.append({"precheck": check})
+
+    # 1. 取消舊委託
     results.append({"cancel_all_orders": cancel_all_orders()})
 
-    # 2. 反手：先平反向倉
+    # 2. 反手前先平反向倉
     if direction == "long":
         results.append({"close_short": close_position("short")})
     else:
         results.append({"close_long": close_position("long")})
 
-    # 3. 開新倉
+    # 3. 開倉
     open_result = open_market(direction)
     results.append({"open": open_result})
 
-    # 4. 取得價格作為 TP/SL 參考
-    # 實盤最準要抓成交均價；這版先用最新價。下一版可改成查成交均價。
+    # 4. 用最新價當 TP/SL 參考
     entry_price = get_last_price()
     results.append({"entry_price_used": str(entry_price)})
 
-    # 5. 掛 6 張 TP
-    for i, (pct, ratio) in enumerate(TP_LEVELS, start=1):
+    # 5. 掛 6 個 TP
+    for i, ((pct, _), size) in enumerate(zip(TP_LEVELS, tp_sizes), start=1):
         results.append({
-            f"tp{i}": place_tp(direction, entry_price, i, pct, ratio)
+            f"tp{i}": place_tp(direction, entry_price, i, pct, size)
         })
 
     # 6. 掛 SL
     results.append({"sl": place_sl(direction, entry_price)})
 
-    return results
+    return {
+        "ok": True,
+        "direction": direction,
+        "result": results,
+    }
 
 
 @app.route("/", methods=["GET"])
@@ -307,12 +324,18 @@ def webhook():
     elif action == "sell":
         result = run_strategy("short")
     else:
-        return jsonify({"ok": False, "error": "action must be buy or sell"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "action must be buy or sell"
+        }), 400
 
-    return jsonify({"ok": True, "dry_run": DRY_RUN, "result": result})
+    return jsonify({
+        "ok": True,
+        "dry_run": DRY_RUN,
+        "result": result
+    })
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
- 
