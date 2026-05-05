@@ -24,7 +24,7 @@ MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
 # True = 模擬；False = 真實下單
-DRY_RUN = True
+DRY_RUN = False
 
 # 總開倉數量
 TOTAL_SIZE = Decimal("0.01")
