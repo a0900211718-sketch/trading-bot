@@ -23,29 +23,22 @@ PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
-# 安全開關：先測試用 True，確認沒問題再改 False
+# True = 模擬；False = 真實下單
 DRY_RUN = True
 
 # 總開倉數量
-# 0.1 ETH 才比較能拆 6 個 TP
-TOTAL_SIZE = Decimal("0.1")
+TOTAL_SIZE = Decimal("0.01")
 
-# ETHUSDT 數量步進，先用 0.01
-SIZE_STEP = Decimal("0.01")
-
-# ETHUSDT 價格精度
+# 數量與價格精度
+SIZE_STEP = Decimal("0.001")
 PRICE_STEP = Decimal("0.01")
 
-TP_LEVELS = [
-    (Decimal("0.005"), Decimal("0.165")),  # TP1 0.5%
-    (Decimal("0.010"), Decimal("0.165")),  # TP2 1%
-    (Decimal("0.020"), Decimal("0.165")),  # TP3 2%
-    (Decimal("0.030"), Decimal("0.165")),  # TP4 3%
-    (Decimal("0.040"), Decimal("0.165")),  # TP5 4%
-    (Decimal("0.050"), Decimal("0.175")),  # TP6 5%
-]
+# TP1：+1% 平50%
+TP_PCT = Decimal("0.01")
+TP_RATIO = Decimal("0.5")
 
-SL_PCT = Decimal("0.10")  # 10%
+# SL：10%
+SL_PCT = Decimal("0.10")
 
 
 def q_price(x: Decimal) -> str:
@@ -58,46 +51,6 @@ def normalize_size(size: Decimal) -> Decimal:
 
 def q_size(size: Decimal) -> str:
     return str(normalize_size(size).quantize(SIZE_STEP, rounding=ROUND_DOWN))
-
-
-def calc_tp_sizes():
-    """
-    前5個TP向下取到0.01，最後一個吃剩餘數量。
-    避免所有TP加總小於總倉位。
-    """
-    sizes = []
-    used = Decimal("0")
-
-    for i, (_, ratio) in enumerate(TP_LEVELS, start=1):
-        if i < len(TP_LEVELS):
-            s = normalize_size(TOTAL_SIZE * ratio)
-            sizes.append(s)
-            used += s
-        else:
-            last = normalize_size(TOTAL_SIZE - used)
-            sizes.append(last)
-
-    return sizes
-
-
-def precheck_sizes():
-    tp_sizes = calc_tp_sizes()
-
-    if TOTAL_SIZE < SIZE_STEP:
-        return False, f"TOTAL_SIZE 太小，至少要 {SIZE_STEP}"
-
-    for i, s in enumerate(tp_sizes, start=1):
-        if s < SIZE_STEP:
-            return False, f"TP{i} 數量太小：{s}，至少要 {SIZE_STEP}"
-
-    if sum(tp_sizes) > TOTAL_SIZE:
-        return False, "TP 加總大於總倉位"
-
-    return True, {
-        "total_size": str(TOTAL_SIZE),
-        "tp_sizes": [str(x) for x in tp_sizes],
-        "tp_sum": str(sum(tp_sizes)),
-    }
 
 
 def sign(timestamp, method, path, body=""):
@@ -207,15 +160,17 @@ def open_market(direction):
     return bitget_post(path, payload)
 
 
-def place_tp(direction, entry_price: Decimal, index: int, pct: Decimal, size: Decimal):
+def place_tp1(direction, entry_price: Decimal):
     path = "/api/v2/mix/order/place-tpsl-order"
 
     hold_side = "long" if direction == "long" else "short"
 
     if direction == "long":
-        trigger_price = entry_price * (Decimal("1") + pct)
+        trigger_price = entry_price * (Decimal("1") + TP_PCT)
     else:
-        trigger_price = entry_price * (Decimal("1") - pct)
+        trigger_price = entry_price * (Decimal("1") - TP_PCT)
+
+    tp_size = normalize_size(TOTAL_SIZE * TP_RATIO)
 
     payload = {
         "symbol": SYMBOL,
@@ -226,8 +181,8 @@ def place_tp(direction, entry_price: Decimal, index: int, pct: Decimal, size: De
         "triggerType": "mark_price",
         "executePrice": "0",
         "holdSide": hold_side,
-        "size": q_size(size),
-        "clientOid": f"tp{index}_" + uuid.uuid4().hex[:18],
+        "size": q_size(tp_size),
+        "clientOid": "tp1_" + uuid.uuid4().hex[:20],
     }
 
     return bitget_post(path, payload)
@@ -260,21 +215,9 @@ def place_sl(direction, entry_price: Decimal):
 
 
 def run_strategy(direction):
-    ok, check = precheck_sizes()
-
-    if not ok:
-        return {
-            "ok": False,
-            "error": "precheck_failed",
-            "detail": check,
-        }
-
     results = []
-    tp_sizes = calc_tp_sizes()
 
-    results.append({"precheck": check})
-
-    # 1. 取消舊委託
+    # 1. 取消舊委託 / 舊TP / 舊SL
     results.append({"cancel_all_orders": cancel_all_orders()})
 
     # 2. 反手前先平反向倉
@@ -283,26 +226,26 @@ def run_strategy(direction):
     else:
         results.append({"close_long": close_position("long")})
 
-    # 3. 開倉
-    open_result = open_market(direction)
-    results.append({"open": open_result})
+    # 3. 開新倉
+    results.append({"open": open_market(direction)})
 
-    # 4. 用最新價當 TP/SL 參考
+    # 4. 抓價格當 TP/SL 參考
     entry_price = get_last_price()
     results.append({"entry_price_used": str(entry_price)})
 
-    # 5. 掛 6 個 TP
-    for i, ((pct, _), size) in enumerate(zip(TP_LEVELS, tp_sizes), start=1):
-        results.append({
-            f"tp{i}": place_tp(direction, entry_price, i, pct, size)
-        })
+    # 5. TP1：1% 平50%
+    results.append({"tp1": place_tp1(direction, entry_price)})
 
-    # 6. 掛 SL
+    # 6. SL：10% 全倉止損
     results.append({"sl": place_sl(direction, entry_price)})
 
     return {
         "ok": True,
         "direction": direction,
+        "total_size": str(TOTAL_SIZE),
+        "tp1_pct": str(TP_PCT),
+        "tp1_ratio": str(TP_RATIO),
+        "sl_pct": str(SL_PCT),
         "result": results,
     }
 
