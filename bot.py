@@ -1,12 +1,5 @@
 from flask import Flask, request, jsonify
-import os
-import time
-import hmac
-import hashlib
-import base64
-import json
-import uuid
-import requests
+import os, time, hmac, hashlib, base64, json, uuid, requests
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 app = Flask(__name__)
@@ -17,19 +10,18 @@ PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 
 BASE_URL = "https://api.bitget.com"
 
-# ===== 基本設定 =====
 SYMBOL = "ETHUSDT"
 PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
-# True = 模擬；False = 真實下單
+# False = 真實下單
 DRY_RUN = False
 
-# 總開倉數量
+# 總倉位 0.02 ETH
 TOTAL_SIZE = Decimal("0.02")
 
-# 數量與價格精度
+# 數量精度
 SIZE_STEP = Decimal("0.001")
 PRICE_STEP = Decimal("0.01")
 
@@ -113,8 +105,6 @@ def get_last_price() -> Decimal:
     )
 
     data = res.json()
-    print("行情回應:", data)
-
     ticker = data.get("data", [{}])[0]
     price = ticker.get("lastPr") or ticker.get("last") or ticker.get("markPrice")
 
@@ -163,7 +153,8 @@ def open_market(direction):
 def place_tp1(direction, entry_price: Decimal):
     path = "/api/v2/mix/order/place-tpsl-order"
 
-    hold_side = "long" if direction == "long" else "short"
+    # 單向持倉用 buy / sell
+    hold_side = "buy" if direction == "long" else "sell"
 
     if direction == "long":
         trigger_price = entry_price * (Decimal("1") + TP_PCT)
@@ -191,7 +182,8 @@ def place_tp1(direction, entry_price: Decimal):
 def place_sl(direction, entry_price: Decimal):
     path = "/api/v2/mix/order/place-tpsl-order"
 
-    hold_side = "long" if direction == "long" else "short"
+    # 單向持倉用 buy / sell
+    hold_side = "buy" if direction == "long" else "sell"
 
     if direction == "long":
         trigger_price = entry_price * (Decimal("1") - SL_PCT)
@@ -217,26 +209,20 @@ def place_sl(direction, entry_price: Decimal):
 def run_strategy(direction):
     results = []
 
-    # 1. 取消舊委託 / 舊TP / 舊SL
     results.append({"cancel_all_orders": cancel_all_orders()})
 
-    # 2. 反手前先平反向倉
+    # 反手前平反向倉
     if direction == "long":
-        results.append({"close_short": close_position("short")})
+        results.append({"close_short": close_position("sell")})
     else:
-        results.append({"close_long": close_position("long")})
+        results.append({"close_long": close_position("buy")})
 
-    # 3. 開新倉
     results.append({"open": open_market(direction)})
 
-    # 4. 抓價格當 TP/SL 參考
     entry_price = get_last_price()
     results.append({"entry_price_used": str(entry_price)})
 
-    # 5. TP1：1% 平50%
     results.append({"tp1": place_tp1(direction, entry_price)})
-
-    # 6. SL：10% 全倉止損
     results.append({"sl": place_sl(direction, entry_price)})
 
     return {
