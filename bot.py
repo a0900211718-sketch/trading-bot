@@ -15,48 +15,40 @@ PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
-# False = 真實下單
+# True = 模擬；False = 真單
 DRY_RUN = False
 
-# 總倉位 0.02 ETH
-TOTAL_SIZE = Decimal("0.02")
-
-# 數量精度
+# 雙向持倉模式專用
+TOTAL_SIZE = Decimal("0.02")   # 開倉 0.02 ETH
+TP_SIZE = Decimal("0.01")      # TP 平 0.01 ETH = 50%
 SIZE_STEP = Decimal("0.001")
 PRICE_STEP = Decimal("0.01")
 
-# TP1：+1% 平50%
-TP_PCT = Decimal("0.01")
-TP_RATIO = Decimal("0.5")
-
-# SL：10%
-SL_PCT = Decimal("0.10")
+TP_PCT = Decimal("0.01")       # TP +1%
+SL_PCT = Decimal("0.10")       # SL 10%
 
 
-def q_price(x: Decimal) -> str:
+def q_price(x):
     return str(x.quantize(PRICE_STEP, rounding=ROUND_HALF_UP))
 
 
-def normalize_size(size: Decimal) -> Decimal:
-    return (size // SIZE_STEP) * SIZE_STEP
-
-
-def q_size(size: Decimal) -> str:
-    return str(normalize_size(size).quantize(SIZE_STEP, rounding=ROUND_DOWN))
+def q_size(x):
+    x = (x // SIZE_STEP) * SIZE_STEP
+    return str(x.quantize(SIZE_STEP, rounding=ROUND_DOWN))
 
 
 def sign(timestamp, method, path, body=""):
-    message = timestamp + method.upper() + path + body
-    mac = hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).digest()
+    msg = timestamp + method.upper() + path + body
+    mac = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
     return base64.b64encode(mac).decode()
 
 
 def headers(method, path, body=""):
-    timestamp = str(int(time.time() * 1000))
+    ts = str(int(time.time() * 1000))
     return {
         "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": sign(timestamp, method, path, body),
-        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-SIGN": sign(ts, method, path, body),
+        "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": PASSPHRASE,
         "Content-Type": "application/json",
         "locale": "en-US",
@@ -67,172 +59,167 @@ def bitget_post(path, payload):
     body = json.dumps(payload, separators=(",", ":"))
 
     if DRY_RUN:
-        print("DRY_RUN POST", path, payload)
-        return {"dry_run": True, "path": path, "payload": payload}
+        print("DRY_RUN", path, payload)
+        return {"code": "00000", "dry_run": True, "payload": payload}
 
-    res = requests.post(
+    r = requests.post(
         BASE_URL + path,
         headers=headers("POST", path, body),
         data=body,
         timeout=10,
     )
 
-    print("Bitget 回應:", res.text)
+    print("Bitget:", r.text)
 
     try:
-        return res.json()
+        return r.json()
     except Exception:
-        return {"raw": res.text}
+        return {"code": "RAW", "raw": r.text}
 
 
-def get_last_price() -> Decimal:
-    path = "/api/v2/mix/market/ticker"
-    params = {
-        "symbol": SYMBOL,
-        "productType": PRODUCT_TYPE,
-    }
+def ok(res):
+    return isinstance(res, dict) and res.get("code") == "00000"
 
+
+def get_price():
     if DRY_RUN:
         return Decimal("2400")
 
-    query = "?" + "&".join([f"{k}={v}" for k, v in params.items()])
-    full_path = path + query
+    path = "/api/v2/mix/market/ticker"
+    query = f"?symbol={SYMBOL}&productType={PRODUCT_TYPE}"
+    full = path + query
 
-    res = requests.get(
-        BASE_URL + full_path,
-        headers=headers("GET", full_path, ""),
+    r = requests.get(
+        BASE_URL + full,
+        headers=headers("GET", full, ""),
         timeout=10,
     )
 
-    data = res.json()
+    data = r.json()
     ticker = data.get("data", [{}])[0]
     price = ticker.get("lastPr") or ticker.get("last") or ticker.get("markPrice")
-
     return Decimal(str(price))
 
 
 def cancel_all_orders():
-    path = "/api/v2/mix/order/cancel-all-orders"
-    payload = {
+    return bitget_post("/api/v2/mix/order/cancel-all-orders", {
         "symbol": SYMBOL,
         "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
-    }
-    return bitget_post(path, payload)
+    })
 
 
 def close_position(hold_side):
-    path = "/api/v2/mix/order/close-positions"
-    payload = {
+    return bitget_post("/api/v2/mix/order/close-positions", {
         "symbol": SYMBOL,
         "productType": PRODUCT_TYPE,
-        "holdSide": hold_side,
-    }
-    return bitget_post(path, payload)
+        "holdSide": hold_side,   # 雙向：long / short
+    })
 
 
 def open_market(direction):
-    path = "/api/v2/mix/order/place-order"
-
     side = "buy" if direction == "long" else "sell"
 
-    payload = {
+    return bitget_post("/api/v2/mix/order/place-order", {
         "symbol": SYMBOL,
         "productType": PRODUCT_TYPE,
         "marginMode": MARGIN_MODE,
         "marginCoin": MARGIN_COIN,
         "size": q_size(TOTAL_SIZE),
         "side": side,
+        "tradeSide": "open",     # 雙向開倉必備
         "orderType": "market",
         "clientOid": "open_" + uuid.uuid4().hex[:20],
-    }
-
-    return bitget_post(path, payload)
+    })
 
 
-def place_tp1(direction, entry_price: Decimal):
-    path = "/api/v2/mix/order/place-tpsl-order"
-
-    # 單向持倉用 buy / sell
-    hold_side = "buy" if direction == "long" else "sell"
+def place_tp(direction, entry):
+    hold_side = "long" if direction == "long" else "short"
 
     if direction == "long":
-        trigger_price = entry_price * (Decimal("1") + TP_PCT)
+        price = entry * (Decimal("1") + TP_PCT)
     else:
-        trigger_price = entry_price * (Decimal("1") - TP_PCT)
+        price = entry * (Decimal("1") - TP_PCT)
 
-    tp_size = normalize_size(TOTAL_SIZE * TP_RATIO)
-
-    payload = {
+    return bitget_post("/api/v2/mix/order/place-tpsl-order", {
         "symbol": SYMBOL,
         "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
         "planType": "profit_plan",
-        "triggerPrice": q_price(trigger_price),
+        "triggerPrice": q_price(price),
         "triggerType": "mark_price",
         "executePrice": "0",
         "holdSide": hold_side,
-        "size": q_size(tp_size),
+        "size": q_size(TP_SIZE),
         "clientOid": "tp1_" + uuid.uuid4().hex[:20],
-    }
-
-    return bitget_post(path, payload)
+    })
 
 
-def place_sl(direction, entry_price: Decimal):
-    path = "/api/v2/mix/order/place-tpsl-order"
-
-    # 單向持倉用 buy / sell
-    hold_side = "buy" if direction == "long" else "sell"
+def place_sl(direction, entry):
+    hold_side = "long" if direction == "long" else "short"
 
     if direction == "long":
-        trigger_price = entry_price * (Decimal("1") - SL_PCT)
+        price = entry * (Decimal("1") - SL_PCT)
     else:
-        trigger_price = entry_price * (Decimal("1") + SL_PCT)
+        price = entry * (Decimal("1") + SL_PCT)
 
-    payload = {
+    return bitget_post("/api/v2/mix/order/place-tpsl-order", {
         "symbol": SYMBOL,
         "productType": PRODUCT_TYPE,
         "marginCoin": MARGIN_COIN,
         "planType": "loss_plan",
-        "triggerPrice": q_price(trigger_price),
+        "triggerPrice": q_price(price),
         "triggerType": "mark_price",
         "executePrice": "0",
         "holdSide": hold_side,
         "size": q_size(TOTAL_SIZE),
         "clientOid": "sl_" + uuid.uuid4().hex[:20],
-    }
-
-    return bitget_post(path, payload)
+    })
 
 
 def run_strategy(direction):
-    results = []
+    result = []
 
-    results.append({"cancel_all_orders": cancel_all_orders()})
+    target = direction
+    opposite = "short" if target == "long" else "long"
 
-    # 反手前平反向倉
-    if direction == "long":
-        results.append({"close_short": close_position("sell")})
-    else:
-        results.append({"close_long": close_position("buy")})
+    result.append({"cancel_all_orders": cancel_all_orders()})
+    result.append({f"close_{opposite}": close_position(opposite)})
 
-    results.append({"open": open_market(direction)})
+    open_res = open_market(target)
+    result.append({"open": open_res})
 
-    entry_price = get_last_price()
-    results.append({"entry_price_used": str(entry_price)})
+    if not ok(open_res):
+        return {"ok": False, "error": "open_failed", "result": result}
 
-    results.append({"tp1": place_tp1(direction, entry_price)})
-    results.append({"sl": place_sl(direction, entry_price)})
+    entry = get_price()
+    result.append({"entry_price_used": str(entry)})
+
+    tp_res = place_tp(target, entry)
+    sl_res = place_sl(target, entry)
+
+    result.append({"tp1": tp_res})
+    result.append({"sl": sl_res})
+
+    # 防裸單：TP 或 SL 失敗，立刻平掉剛開的倉
+    if not ok(tp_res) or not ok(sl_res):
+        emergency = close_position(target)
+        result.append({"emergency_close": emergency})
+        return {
+            "ok": False,
+            "error": "tp_or_sl_failed_emergency_closed",
+            "direction": target,
+            "result": result,
+        }
 
     return {
         "ok": True,
-        "direction": direction,
+        "direction": target,
         "total_size": str(TOTAL_SIZE),
-        "tp1_pct": str(TP_PCT),
-        "tp1_ratio": str(TP_RATIO),
+        "tp_size": str(TP_SIZE),
+        "tp_pct": str(TP_PCT),
         "sl_pct": str(SL_PCT),
-        "result": results,
+        "result": result,
     }
 
 
@@ -244,24 +231,21 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json or {}
-    print("收到 TradingView:", data)
+    print("收到:", data)
 
     action = data.get("action")
 
     if action == "buy":
-        result = run_strategy("long")
+        res = run_strategy("long")
     elif action == "sell":
-        result = run_strategy("short")
+        res = run_strategy("short")
     else:
-        return jsonify({
-            "ok": False,
-            "error": "action must be buy or sell"
-        }), 400
+        return jsonify({"ok": False, "error": "action must be buy or sell"}), 400
 
     return jsonify({
-        "ok": True,
+        "ok": res.get("ok"),
         "dry_run": DRY_RUN,
-        "result": result
+        "result": res,
     })
 
 
