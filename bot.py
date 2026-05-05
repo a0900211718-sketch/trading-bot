@@ -27,7 +27,7 @@ MARGIN_COIN = "USDT"
 DRY_RUN = False
 
 # 開倉數量：你現在先用小單測試
-TOTAL_SIZE = Decimal("0.001")
+TOTAL_SIZE = Decimal("0.01")
 
 # 價格與數量精度，ETHUSDT 一般可用這樣；若 Bitget 回報精度錯，再調整
 PRICE_DECIMALS = Decimal("0.01")
