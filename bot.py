@@ -27,7 +27,7 @@ MARGIN_COIN = "USDT"
 DRY_RUN = False
 
 # 總開倉數量
-TOTAL_SIZE = Decimal("0.01")
+TOTAL_SIZE = Decimal("0.02")
 
 # 數量與價格精度
 SIZE_STEP = Decimal("0.001")
