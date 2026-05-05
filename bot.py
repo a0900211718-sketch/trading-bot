@@ -24,7 +24,7 @@ MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
 # 先模擬，確認都對再改 False
-DRY_RUN = True
+DRY_RUN = False
 
 # 開倉數量：你現在先用小單測試
 TOTAL_SIZE = Decimal("0.001")
