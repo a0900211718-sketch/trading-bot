@@ -15,17 +15,16 @@ PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_MODE = "crossed"
 MARGIN_COIN = "USDT"
 
-# True = 模擬；False = 真單
 DRY_RUN = False
 
-# 雙向持倉模式專用
-TOTAL_SIZE = Decimal("0.02")   # 開倉 0.02 ETH
-TP_SIZE = Decimal("0.01")      # TP 平 0.01 ETH = 50%
+TOTAL_SIZE = Decimal("0.02")
+TP_SIZE = Decimal("0.01")
+
 SIZE_STEP = Decimal("0.001")
 PRICE_STEP = Decimal("0.01")
 
-TP_PCT = Decimal("0.01")       # TP +1%
-SL_PCT = Decimal("0.10")       # SL 10%
+TP_PCT = Decimal("0.01")
+SL_PCT = Decimal("0.10")
 
 
 def q_price(x):
@@ -59,7 +58,6 @@ def bitget_post(path, payload):
     body = json.dumps(payload, separators=(",", ":"))
 
     if DRY_RUN:
-        print("DRY_RUN", path, payload)
         return {"code": "00000", "dry_run": True, "payload": payload}
 
     r = requests.post(
@@ -113,7 +111,7 @@ def close_position(hold_side):
     return bitget_post("/api/v2/mix/order/close-positions", {
         "symbol": SYMBOL,
         "productType": PRODUCT_TYPE,
-        "holdSide": hold_side,   # 雙向：long / short
+        "holdSide": hold_side,
     })
 
 
@@ -127,7 +125,7 @@ def open_market(direction):
         "marginCoin": MARGIN_COIN,
         "size": q_size(TOTAL_SIZE),
         "side": side,
-        "tradeSide": "open",     # 雙向開倉必備
+        "tradeSide": "open",
         "orderType": "market",
         "clientOid": "open_" + uuid.uuid4().hex[:20],
     })
@@ -136,10 +134,7 @@ def open_market(direction):
 def place_tp(direction, entry):
     hold_side = "long" if direction == "long" else "short"
 
-    if direction == "long":
-        price = entry * (Decimal("1") + TP_PCT)
-    else:
-        price = entry * (Decimal("1") - TP_PCT)
+    price = entry * (Decimal("1") + TP_PCT) if direction == "long" else entry * (Decimal("1") - TP_PCT)
 
     return bitget_post("/api/v2/mix/order/place-tpsl-order", {
         "symbol": SYMBOL,
@@ -158,10 +153,7 @@ def place_tp(direction, entry):
 def place_sl(direction, entry):
     hold_side = "long" if direction == "long" else "short"
 
-    if direction == "long":
-        price = entry * (Decimal("1") - SL_PCT)
-    else:
-        price = entry * (Decimal("1") + SL_PCT)
+    price = entry * (Decimal("1") - SL_PCT) if direction == "long" else entry * (Decimal("1") + SL_PCT)
 
     return bitget_post("/api/v2/mix/order/place-tpsl-order", {
         "symbol": SYMBOL,
@@ -186,6 +178,8 @@ def run_strategy(direction):
     result.append({"cancel_all_orders": cancel_all_orders()})
     result.append({f"close_{opposite}": close_position(opposite)})
 
+    time.sleep(0.5)
+
     open_res = open_market(target)
     result.append({"open": open_res})
 
@@ -201,7 +195,6 @@ def run_strategy(direction):
     result.append({"tp1": tp_res})
     result.append({"sl": sl_res})
 
-    # 防裸單：TP 或 SL 失敗，立刻平掉剛開的倉
     if not ok(tp_res) or not ok(sl_res):
         emergency = close_position(target)
         result.append({"emergency_close": emergency})
@@ -225,7 +218,7 @@ def run_strategy(direction):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "bot is running"
+    return "OK", 200
 
 
 @app.route("/webhook", methods=["POST"])
